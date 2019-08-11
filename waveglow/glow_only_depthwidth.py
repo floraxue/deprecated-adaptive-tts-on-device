@@ -135,9 +135,12 @@ class WN(torch.nn.Module):
             padding = int((kernel_size*dilation - dilation)/2)
             in_layer = torch.nn.Conv1d(n_channels, n_channels, kernel_size,
                                        dilation=dilation, padding=padding, groups=n_channels)
-            depthwise = torch.nn.Conv1d(n_channels, 2*n_channels, 1)
-            in_layer = torch.nn.Sequential(in_layer, depthwise)
+            
             in_layer = torch.nn.utils.weight_norm(in_layer, name='weight')
+            depthwise = torch.nn.Conv1d(n_channels, 2*n_channels, 1)
+            
+            depthwise  = torch.nn.utils.weight_norm(depthwise, name='weight')
+            in_layer = torch.nn.Sequential(in_layer, depthwise)
             self.in_layers.append(in_layer)
 
             cond_layer = torch.nn.Conv1d(n_mel_channels, 2*n_channels, 1)
@@ -303,7 +306,15 @@ class WaveGlow(torch.nn.Module):
             WN.res_skip_layers = remove(WN.res_skip_layers)
         return waveglow
 
-
+def remove_in_layers(conv_list):
+    new_conv_list = torch.nn.ModuleList()
+    for old_conv in conv_list:
+	first = torch.nn.utils.remove_weight_norm(old_conv[0])
+	second = torch.nn.utils.remove_weight_norm(old_conv[1])
+        old_conv = torch.nn.Sequential(first, second)
+	new_conv_list.append(old_conv)
+    return new_conv_list
+	
 def remove(conv_list):
     new_conv_list = torch.nn.ModuleList()
     for old_conv in conv_list:
