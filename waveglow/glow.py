@@ -108,16 +108,19 @@ class WN(torch.nn.Module):
     from WaveNet is the convolutions need not be causal.  There is also no dilation
     size reset.  The dilation only doubles on each layer
     """
-    def __init__(self, n_in_channels, n_mel_channels, n_layers, n_channels,
+    def __init__(self, n_in_channels, n_mel_channels, embed_size, n_layers, n_channels,
                  kernel_size):
         super(WN, self).__init__()
         assert(kernel_size % 2 == 1)
         assert(n_channels % 2 == 0)
         self.n_layers = n_layers
         self.n_channels = n_channels
+        self.kernel_size = kernel_size
         self.in_layers = torch.nn.ModuleList()
         self.res_skip_layers = torch.nn.ModuleList()
         self.cond_layers = torch.nn.ModuleList()
+        self.adapters_w = torch.nn.ModuleList()
+        self.adapters_b = torch.nn.ModuleList()
 
         start = torch.nn.Conv1d(n_in_channels, n_channels, 1)
         start = torch.nn.utils.weight_norm(start, name='weight')
@@ -131,6 +134,11 @@ class WN(torch.nn.Module):
         self.end = end
 
         for i in range(n_layers):
+            adapter_w = torch.nn.Linear(embed_size, n_channels * kernel_size)
+            self.adapters_w.append(adapter_w)
+            adapter_b = torch.nn.Linear(embed_size, n_channels)
+            self.adapters_b.append(adapter_b)
+
             dilation = 2 ** i
             padding = int((kernel_size*dilation - dilation)/2)
             in_layer = torch.nn.Conv1d(n_channels, 2*n_channels, kernel_size,
@@ -152,13 +160,26 @@ class WN(torch.nn.Module):
             self.res_skip_layers.append(res_skip_layer)
 
     def forward(self, forward_input):
-        audio, spect = forward_input
+        audio, spect, emb = forward_input
         audio = self.start(audio)
 
         for i in range(self.n_layers):
+            # Hyperconvolution
+            hyperconv_w = self.adapters_w[i](emb).view(-1, 1, self.kernel_size)
+            hyperconv_b = self.adapters_b[i](emb).view(-1)
+            batch_size, nsq, lchunk = audio.size()
+            audio_after_emb = torch.nn.functional.conv1d(audio.view(1, -1, lchunk),
+                                                         hyperconv_w, bias=hyperconv_b,
+                                                         padding=self.kernel_size // 2,
+                                                         groups=batch_size * nsq)
+            audio_after_emb = audio_after_emb.view(batch_size, self.n_channels,
+                                                   lchunk)
+
+            in_layer_out = self.in_layers[i](audio_after_emb)
+            cond_layer_out = self.cond_layers[i](spect)
             acts = fused_add_tanh_sigmoid_multiply(
-                self.in_layers[i](audio),
-                self.cond_layers[i](spect),
+                in_layer_out,
+                cond_layer_out,
                 torch.IntTensor([self.n_channels]))
 
             res_skip_acts = self.res_skip_layers[i](acts)
@@ -176,8 +197,8 @@ class WN(torch.nn.Module):
 
 
 class WaveGlow(torch.nn.Module):
-    def __init__(self, n_mel_channels, n_flows, n_group, n_early_every,
-                 n_early_size, WN_config):
+    def __init__(self, n_mel_channels, embed_size, n_targets, n_flows, n_group,
+                 n_early_every, n_early_size, WN_config):
         super(WaveGlow, self).__init__()
 
         self.upsample = torch.nn.ConvTranspose1d(n_mel_channels,
@@ -191,6 +212,8 @@ class WaveGlow(torch.nn.Module):
         self.WN = torch.nn.ModuleList()
         self.convinv = torch.nn.ModuleList()
 
+        self.embedding = torch.nn.Embedding(n_targets, embed_size)
+
         n_half = int(n_group/2)
 
         # Set up layers with the right sizes based on how many dimensions
@@ -201,7 +224,7 @@ class WaveGlow(torch.nn.Module):
                 n_half = n_half - int(self.n_early_size/2)
                 n_remaining_channels = n_remaining_channels - self.n_early_size
             self.convinv.append(Invertible1x1Conv(n_remaining_channels))
-            self.WN.append(WN(n_half, n_mel_channels*n_group, **WN_config))
+            self.WN.append(WN(n_half, n_mel_channels*n_group, embed_size, **WN_config))
         self.n_remaining_channels = n_remaining_channels  # Useful during inference
 
     def forward(self, forward_input):
@@ -209,7 +232,7 @@ class WaveGlow(torch.nn.Module):
         forward_input[0] = mel_spectrogram:  batch x n_mel_channels x frames
         forward_input[1] = audio: batch x time
         """
-        spect, audio = forward_input
+        spect, audio, sid = forward_input
 
         #  Upsample spectrogram to size of audio
         spect = self.upsample(spect)
@@ -221,6 +244,9 @@ class WaveGlow(torch.nn.Module):
         spect = spect.contiguous().view(spect.size(0), spect.size(1), -1).permute(0, 2, 1)
 
         audio = audio.unfold(1, self.n_group, self.n_group).permute(0, 2, 1)
+
+        emb = self.embedding(sid)
+
         output_audio = []
         log_s_list = []
         log_det_W_list = []
@@ -237,7 +263,7 @@ class WaveGlow(torch.nn.Module):
             audio_0 = audio[:,:n_half,:]
             audio_1 = audio[:,n_half:,:]
 
-            output = self.WN[k]((audio_0, spect))
+            output = self.WN[k]((audio_0, spect, emb))
             log_s = output[:, n_half:, :]
             b = output[:, :n_half, :]
             audio_1 = torch.exp(log_s)*audio_1 + b
@@ -248,7 +274,7 @@ class WaveGlow(torch.nn.Module):
         output_audio.append(audio)
         return torch.cat(output_audio,1), log_s_list, log_det_W_list
 
-    def infer(self, spect, sigma=1.0):
+    def infer(self, spect, sid, sigma=1.0):
         spect = self.upsample(spect)
         # trim conv artifacts. maybe pad spec to kernel multiple
         time_cutoff = self.upsample.kernel_size[0] - self.upsample.stride[0]
@@ -268,12 +294,15 @@ class WaveGlow(torch.nn.Module):
 
         audio = torch.autograd.Variable(sigma*audio)
 
+        # TODO may need to optimize for emb here
+        emb = self.embedding(sid)
+
         for k in reversed(range(self.n_flows)):
             n_half = int(audio.size(1)/2)
             audio_0 = audio[:,:n_half,:]
             audio_1 = audio[:,n_half:,:]
 
-            output = self.WN[k]((audio_0, spect))
+            output = self.WN[k]((audio_0, spect, emb))
             s = output[:, n_half:, :]
             b = output[:, :n_half, :]
             audio_1 = (audio_1 - b)/torch.exp(s)

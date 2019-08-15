@@ -24,17 +24,51 @@
 #  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # *****************************************************************************
+import json
 import os
-from scipy.io.wavfile import write
+from copy import deepcopy
+
+import numpy as np
 import torch
-from mel2samp import files_to_list, MAX_WAV_VALUE
+from scipy.io.wavfile import write
+from torch.utils.data import DataLoader
+
 from denoiser import Denoiser
-import pickle
+from mel2samp import Mel2Samp, MAX_WAV_VALUE
 
 
-def main(mel_files, waveglow_path, sigma, output_dir, sampling_rate, is_fp16,
-         denoiser_strength):
-    mel_files = files_to_list(mel_files)
+def create_reverse_dict(inp):
+    reverse = {}
+    for k, v in inp.items():
+        assert v not in reverse
+        reverse[v] = k
+    return reverse
+
+
+def save_audio_chunks(frames, filename, stride, sr=22050, ymax=0.98):
+    # Generate stream
+    y = torch.zeros((len(frames) - 1) * stride + len(frames[0]))
+    for i, x in enumerate(frames):
+        y[i * stride:i * stride + len(x)] += x
+    # To numpy & deemph
+    y = y.numpy().astype(np.float32)
+    # if deemph>0:
+    #     y=deemphasis(y,alpha=deemph)
+    # Normalize
+    # if normalize:
+    #     y-=np.mean(y)
+    #     mx=np.max(np.abs(y))
+    #     if mx>0:
+    #         y*=ymax/mx
+    # else:
+    y = np.clip(y, -ymax, ymax)
+    # To 16 bit & save
+    write(filename, sr, np.array(y * 32767, dtype=np.int16))
+    return y
+
+
+def main(waveglow_path, sigma, output_dir, is_fp16, denoiser_strength):
+    # mel_files = files_to_list(mel_files)
     waveglow = torch.load(waveglow_path)['model']
     waveglow = waveglow.remove_weightnorm(waveglow)
     waveglow.cuda().eval()
@@ -45,50 +79,88 @@ def main(mel_files, waveglow_path, sigma, output_dir, sampling_rate, is_fp16,
     if denoiser_strength > 0:
         denoiser = Denoiser(waveglow).cuda()
 
-    mel_files = ["/rscratch/tianren/Real-Time-Voice-Cloning/demo_melspec_00.p"]
+    testset = Mel2Samp(**data_config)
+    # =====START: ADDED FOR DISTRIBUTED======
+    # train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
+    # =====END:   ADDED FOR DISTRIBUTED======
+    test_loader = DataLoader(testset, num_workers=32, shuffle=False,
+                              # sampler=train_sampler,
+                              batch_size=12,
+                              pin_memory=False,
+                              drop_last=True)
 
-    for i, file_path in enumerate(mel_files):
-        file_name = os.path.splitext(os.path.basename(file_path))[0]
-        print("using laptop version")
+    speakers_to_sids = deepcopy(testset.speakers)
+    sids_to_speakers = create_reverse_dict(speakers_to_sids)
+    ut_to_uids = deepcopy(testset.utterances)
+    uids_to_ut = create_reverse_dict(ut_to_uids)
+
+    sid_target = np.random.randint(len(speakers_to_sids))
+    speaker_target = sids_to_speakers[sid_target]
+    sid_target = torch.LongTensor([[sid_target] *
+                                   test_loader.batch_size]).view(
+        test_loader.batch_size, 1).to(device)
+
+    audios = []
+    n_audios = 0
+    for i, batch in enumerate(test_loader):
+        mel_source, _, sid_source, uid_source, is_last = batch
+        mel_source = mel_source.to(device)
         import pdb
         pdb.set_trace()
 
-        # mel = torch.load(file_path)
-        mel = pickle.load(open(file_path, "rb"))
-        mel = torch.tensor(mel)
-
-        mel = torch.autograd.Variable(mel.cuda())
-        mel = torch.unsqueeze(mel, 0)
-        mel = mel.half() if is_fp16 else mel
         with torch.no_grad():
-            audio = waveglow.infer(mel, sigma=sigma)
+            predicted = waveglow.infer(mel_source, sid_target, sigma=sigma)
             if denoiser_strength > 0:
-                audio = denoiser(audio, denoiser_strength)
-            audio = audio * MAX_WAV_VALUE
-        audio = audio.squeeze()
-        audio = audio.cpu().numpy()
-        audio = audio.astype('int16')
-        audio_path = os.path.join(
-            output_dir, "{}_synthesis.wav".format(file_name))
-        write(audio_path, sampling_rate, audio)
-        print(audio_path)
+                predicted = denoiser(predicted, denoiser_strength)
+            predicted = predicted * MAX_WAV_VALUE
+
+        for j in range(len(predicted)):
+            # p = predicted[j].squeeze().cpu().numpy().astype('int16')
+            p = predicted[j].cpu()
+            audios.append(p)
+            speaker_source = sids_to_speakers[sid_source[j].data.item()]
+            ut_source = uids_to_ut[uid_source[j].data.item()]
+            last = is_last[j].data.item()
+            if last:
+                audio_path = os.path.join(
+                    output_dir,
+                    "{}_{}_to_{}_synthesis.wav".format(speaker_source,
+                                                       ut_source,
+                                                       speaker_target))
+                print("Synthesizing file No.{} at {}".format(n_audios,
+                                                             audio_path))
+                save_audio_chunks(audios, audio_path, data_config['stride'],
+                                  data_config['sampling_rate'])
+
+                audios = []
+                n_audios += 1
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('-f', "--filelist_path", required=True)
+    # parser.add_argument('-f', "--filelist_path", required=True)
+    parser.add_argument('-c', '--config', type=str,
+                        help='JSON file for configuration')
     parser.add_argument('-w', '--waveglow_path',
                         help='Path to waveglow decoder checkpoint with model')
     parser.add_argument('-o', "--output_dir", required=True)
     parser.add_argument("-s", "--sigma", default=1.0, type=float)
-    parser.add_argument("--sampling_rate", default=22050, type=int)
+    # parser.add_argument("--sampling_rate", default=22050, type=int)
     parser.add_argument("--is_fp16", action="store_true")
     parser.add_argument("-d", "--denoiser_strength", default=0.0, type=float,
                         help='Removes model bias. Start with 0.1 and adjust')
 
     args = parser.parse_args()
+    with open(args.config) as f:
+        data = f.read()
+    config = json.loads(data)
+    global data_config
+    data_config = config["data_config"]
+    data_config['split'] = 'test'
+    global device
+    device = 'cuda'
 
-    main(args.filelist_path, args.waveglow_path, args.sigma, args.output_dir,
-         args.sampling_rate, args.is_fp16, args.denoiser_strength)
+    main(args.waveglow_path, args.sigma, args.output_dir,
+         args.is_fp16, args.denoiser_strength)

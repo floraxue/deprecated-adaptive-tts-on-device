@@ -52,7 +52,7 @@ def load_checkpoint(checkpoint_path, model, optimizer):
 def save_checkpoint(model, optimizer, learning_rate, iteration, filepath):
     print("Saving model and optimizer state at iteration {} to {}".format(
           iteration, filepath))
-    model_for_saving = WaveGlow(**waveglow_config).cuda()
+    model_for_saving = WaveGlow(**waveglow_config).to(device)
     model_for_saving.load_state_dict(model.state_dict())
     torch.save({'model': model_for_saving,
                 'iteration': iteration,
@@ -69,8 +69,19 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         init_distributed(rank, num_gpus, group_name, **dist_config)
     #=====END:   ADDED FOR DISTRIBUTED======
 
+    trainset = Mel2Samp(**data_config)
+    # =====START: ADDED FOR DISTRIBUTED======
+    train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
+    # =====END:   ADDED FOR DISTRIBUTED======
+    train_loader = DataLoader(trainset, num_workers=0, shuffle=False,
+                              sampler=train_sampler,
+                              batch_size=batch_size,
+                              pin_memory=False,
+                              drop_last=True)
+
     criterion = WaveGlowLoss(sigma)
-    model = WaveGlow(**waveglow_config).cuda()
+    waveglow_config["n_targets"] = trainset.n_max_speakers
+    model = WaveGlow(**waveglow_config).to(device)
 
     #=====START: ADDED FOR DISTRIBUTED======
     if num_gpus > 1:
@@ -89,16 +100,6 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         model, optimizer, iteration = load_checkpoint(checkpoint_path, model,
                                                       optimizer)
         iteration += 1  # next iteration is iteration + 1
-
-    trainset = Mel2Samp(**data_config)
-    # =====START: ADDED FOR DISTRIBUTED======
-    train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
-    # =====END:   ADDED FOR DISTRIBUTED======
-    train_loader = DataLoader(trainset, num_workers=1, shuffle=False,
-                              sampler=train_sampler,
-                              batch_size=batch_size,
-                              pin_memory=False,
-                              drop_last=True)
 
     # Get shared output_directory ready
     if rank == 0:
@@ -119,10 +120,11 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
         for i, batch in enumerate(train_loader):
             model.zero_grad()
 
-            mel, audio = batch
-            mel = torch.autograd.Variable(mel.cuda())
-            audio = torch.autograd.Variable(audio.cuda())
-            outputs = model((mel, audio))
+            mel, audio, sid, _, _ = batch
+            mel = torch.autograd.Variable(mel.to(device))
+            audio = torch.autograd.Variable(audio.to(device))
+            sid = sid.to(device)
+            outputs = model((mel, audio, sid))
 
             loss = criterion(outputs)
             if num_gpus > 1:
@@ -173,6 +175,7 @@ if __name__ == "__main__":
     global waveglow_config
     waveglow_config = config["waveglow_config"]
 
+    device = "cuda"
     num_gpus = torch.cuda.device_count()
     if num_gpus > 1:
         if args.group_name == '':
