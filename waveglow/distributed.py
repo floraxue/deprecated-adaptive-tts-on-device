@@ -143,7 +143,8 @@ def apply_gradient_allreduce(module):
 
 
 def main(config, stdout_dir, args_str):
-    args_list = ['train.py']
+    args_list = ['-u']
+    args_list.append('train.py')
     args_list += args_str.split(' ') if len(args_str) > 0 else []
 
     args_list.append('--config={}'.format(config))
@@ -163,7 +164,10 @@ def main(config, stdout_dir, args_str):
         stdout = None if i == 0 else open(
             os.path.join(stdout_dir, "GPU_{}.log".format(i)), "w")
         print(args_list)
-        p = subprocess.Popen([str(sys.executable)]+args_list, stdout=stdout)
+        my_env = os.environ.copy()
+        my_env["OMP_NUM_THREADS"] = "1"
+        p = subprocess.Popen([str(sys.executable)]+args_list,
+                             stdout=stdout, env=my_env)
         workers.append(p)
 
     for p in workers:

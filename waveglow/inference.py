@@ -34,7 +34,7 @@ from scipy.io.wavfile import write
 from torch.utils.data import DataLoader
 
 from denoiser import Denoiser
-from mel2samp import Mel2Samp, MAX_WAV_VALUE
+from mel2samp import Mel2Samp
 
 
 def create_reverse_dict(inp):
@@ -45,7 +45,8 @@ def create_reverse_dict(inp):
     return reverse
 
 
-def save_audio_chunks(frames, filename, stride, sr=22050, ymax=0.98):
+def save_audio_chunks(frames, filename, stride, sr=22050, ymax=0.98,
+                      normalize=True):
     # Generate stream
     y = torch.zeros((len(frames) - 1) * stride + len(frames[0]))
     for i, x in enumerate(frames):
@@ -55,13 +56,13 @@ def save_audio_chunks(frames, filename, stride, sr=22050, ymax=0.98):
     # if deemph>0:
     #     y=deemphasis(y,alpha=deemph)
     # Normalize
-    # if normalize:
-    #     y-=np.mean(y)
-    #     mx=np.max(np.abs(y))
-    #     if mx>0:
-    #         y*=ymax/mx
-    # else:
-    y = np.clip(y, -ymax, ymax)
+    if normalize:
+        y -= np.mean(y)
+        mx = np.max(np.abs(y))
+        if mx > 0:
+            y *= ymax / mx
+    else:
+        y = np.clip(y, -ymax, ymax)
     # To 16 bit & save
     write(filename, sr, np.array(y * 32767, dtype=np.int16))
     return y
@@ -83,7 +84,7 @@ def main(waveglow_path, sigma, output_dir, is_fp16, denoiser_strength):
     # =====START: ADDED FOR DISTRIBUTED======
     # train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
     # =====END:   ADDED FOR DISTRIBUTED======
-    test_loader = DataLoader(testset, num_workers=32, shuffle=False,
+    test_loader = DataLoader(testset, num_workers=0, shuffle=False,
                               # sampler=train_sampler,
                               batch_size=12,
                               pin_memory=False,
@@ -101,6 +102,7 @@ def main(waveglow_path, sigma, output_dir, is_fp16, denoiser_strength):
         test_loader.batch_size, 1).to(device)
 
     audios = []
+    mels = []
     n_audios = 0
     for i, batch in enumerate(test_loader):
         mel_source, _, sid_source, uid_source, is_last = batch
@@ -109,19 +111,27 @@ def main(waveglow_path, sigma, output_dir, is_fp16, denoiser_strength):
         pdb.set_trace()
 
         with torch.no_grad():
-            predicted = waveglow.infer(mel_source, sid_target, sigma=sigma)
+            predicted = waveglow.infer(mel_source, sigma=sigma)
             if denoiser_strength > 0:
                 predicted = denoiser(predicted, denoiser_strength)
-            predicted = predicted * MAX_WAV_VALUE
+            # predicted = predicted * MAX_WAV_VALUE
 
         for j in range(len(predicted)):
-            # p = predicted[j].squeeze().cpu().numpy().astype('int16')
             p = predicted[j].cpu()
             audios.append(p)
+            mels.append(mel_source[j].cpu())
             speaker_source = sids_to_speakers[sid_source[j].data.item()]
             ut_source = uids_to_ut[uid_source[j].data.item()]
             last = is_last[j].data.item()
             if last:
+                ## Hacking to print mel_source here
+                fname = os.path.join(output_dir,
+                                     "{}_{}_mel.pt".format(speaker_source, ut_source))
+                pdb.set_trace()
+                torch.save(mels, fname)
+                print("Saved mel to {}".format(fname))
+                ##
+
                 audio_path = os.path.join(
                     output_dir,
                     "{}_{}_to_{}_synthesis.wav".format(speaker_source,
@@ -133,7 +143,43 @@ def main(waveglow_path, sigma, output_dir, is_fp16, denoiser_strength):
                                   data_config['sampling_rate'])
 
                 audios = []
+                mels = []
                 n_audios += 1
+
+
+def test_pretrained_wg_infer(waveglow_path, mel_path, output_dir, sigma,
+                             ymax=0.98):
+    waveglow = torch.load(waveglow_path)['model']
+    waveglow = waveglow.remove_weightnorm(waveglow)
+    waveglow.cuda().eval()
+
+    # concat the mels
+    import pdb
+    pdb.set_trace()
+    mel = torch.load(mel_path)
+    mel = torch.cat(mel, dim=1)
+    mel = torch.autograd.Variable(mel.cuda())
+    mel = torch.unsqueeze(mel, 0)
+
+    with torch.no_grad():
+        predicted = waveglow.infer(mel, sigma=sigma)
+
+    # post processing
+    predicted = predicted.squeeze()
+    predicted = predicted.cpu().numpy()
+    predicted = predicted.astype(np.float32)
+    predicted -= np.mean(predicted)
+    mx = np.max(np.abs(predicted))
+    if mx > 0:
+        predicted *= ymax / mx
+
+    # saving the output
+    file_name = os.path.splitext(os.path.basename(mel_path))[0]
+    audio_path = os.path.join(
+        output_dir, "{}_synthesis.wav".format(file_name))
+    write(audio_path, data_config['sampling_rate'],
+          np.array(predicted * 32767, dtype=np.int16))
+    print(audio_path)
 
 
 if __name__ == "__main__":
@@ -145,6 +191,8 @@ if __name__ == "__main__":
                         help='JSON file for configuration')
     parser.add_argument('-w', '--waveglow_path',
                         help='Path to waveglow decoder checkpoint with model')
+    parser.add_argument('-m', "--mel_path",
+                        help='Path to the mel for testing on pretrained')
     parser.add_argument('-o', "--output_dir", required=True)
     parser.add_argument("-s", "--sigma", default=1.0, type=float)
     # parser.add_argument("--sampling_rate", default=22050, type=int)
@@ -162,5 +210,9 @@ if __name__ == "__main__":
     global device
     device = 'cuda'
 
+    # test_pretrained_wg_infer(args.waveglow_path, args.mel_path,
+    #                          args.output_dir, args.sigma)
+
     main(args.waveglow_path, args.sigma, args.output_dir,
          args.is_fp16, args.denoiser_strength)
+

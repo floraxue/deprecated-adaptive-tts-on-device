@@ -73,14 +73,14 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
     # =====START: ADDED FOR DISTRIBUTED======
     train_sampler = DistributedSampler(trainset) if num_gpus > 1 else None
     # =====END:   ADDED FOR DISTRIBUTED======
-    train_loader = DataLoader(trainset, num_workers=0, shuffle=False,
+    train_loader = DataLoader(trainset, num_workers=1, shuffle=False,
                               sampler=train_sampler,
                               batch_size=batch_size,
                               pin_memory=False,
                               drop_last=True)
 
     criterion = WaveGlowLoss(sigma)
-    waveglow_config["n_targets"] = trainset.n_max_speakers
+    # waveglow_config["n_targets"] = trainset.n_max_speakers
     model = WaveGlow(**waveglow_config).to(device)
 
     #=====START: ADDED FOR DISTRIBUTED======
@@ -124,7 +124,7 @@ def train(num_gpus, rank, group_name, output_directory, epochs, learning_rate,
             mel = torch.autograd.Variable(mel.to(device))
             audio = torch.autograd.Variable(audio.to(device))
             sid = sid.to(device)
-            outputs = model((mel, audio, sid))
+            outputs = model((mel, audio))
 
             loss = criterion(outputs)
             if num_gpus > 1:

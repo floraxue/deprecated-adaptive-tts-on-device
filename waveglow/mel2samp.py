@@ -71,7 +71,7 @@ class Mel2Samp(torch.utils.data.Dataset):
 
     def __init__(self, path_in, split, segment_length, filter_length,
                  hop_length, win_length, sampling_rate, mel_fmin, mel_fmax,
-                 stride, temp_jitter=False, store_in_ram=True, seed=0,
+                 stride, temp_jitter=False, store_in_ram=False, seed=0,
                  split_utterances=True, pc_split_utterances=0.1,
                  split_speakers=False, pc_split_speakers=0.1,
                  frame_energy_thres=0, do_audio_load=True,
@@ -185,8 +185,11 @@ class Mel2Samp(torch.utils.data.Dataset):
         if do_audio_load:
             for i, filename in enumerate(self.filenames):
                 if verbose:
-                    print('\rRead audio {:5.1f}%'.format(
-                        100 * (i + 1) / len(self.filenames)), end='')
+                    if i % 1000 == 0:
+                        print('Read {} out of {} files'.
+                              format(i + 1, len(self.filenames)))
+                    # print('\rRead audio {:5.1f}%'.format(
+                    #     100 * (i + 1) / len(self.filenames)), end='')
                 # Info
                 spk, ut = self.filename_split(filename)
                 ispk, iut = self.speakers[spk], self.utterances[ut]
@@ -249,10 +252,9 @@ class Mel2Samp(torch.utils.data.Dataset):
         return aux[0], aux[1]
 
     def get_mel(self, audio):
-        audio_norm = audio / MAX_WAV_VALUE
-        audio_norm = audio_norm.unsqueeze(0)
-        audio_norm = torch.autograd.Variable(audio_norm, requires_grad=False)
-        melspec = self.stft.mel_spectrogram(audio_norm)
+        audio = audio.unsqueeze(0)
+        audio = torch.autograd.Variable(audio, requires_grad=False)
+        melspec = self.stft.mel_spectrogram(audio)
         melspec = torch.squeeze(melspec, 0)
         return melspec
 
@@ -280,7 +282,6 @@ class Mel2Samp(torch.utils.data.Dataset):
         y = torch.LongTensor([ispk])
 
         mel = self.get_mel(x)
-        x = x / MAX_WAV_VALUE
 
         return mel, x, y, ichap, last
 
